@@ -1,6 +1,6 @@
 # file: main.py
 # author: Yug Patel
-# last modified: 26 November 2025
+# last modified: 3 December 2025
 
 import ssl
 import socket
@@ -8,28 +8,52 @@ import socket
 class URL:
     def __init__(self, url):
         """
-        a url contains these properties: scheme, host, port, path
+        Initilize the following variables(in order from left to right in the URL):
+            metascheme: allows view-source
+            scheme: allows http, https, file, data
+            host: host part of the URL
+            port: mentioning a port is optional
+            path: everything following port is considered part of the path
+
+        Currently urls for data:text, file:/// do not allow a port in the url.
         """
-        if url == None:
+
+        if url is None:
+            self.metascheme = None
             self.scheme = None
-            self.port = None
             self.host = None
+            self.port = None
+            self.path = None
             return
 
         # check for data scheme first, because it needs to be handled differently
-        if url[:4] == "data": # example, "data:text/html, Hello world"
+        if url.startswith("data"): # example, "data:text/html, Hello world"
+            self.metascheme = None
             self.scheme, self.path = url.split(":", 1)
-            self.port = None
             self.host = None
+            self.port = None
             return
         
         # check for view-source, example: "view-source:https://example.org/"
-        if url.split(":", 1) == "view-source":
-            view_source, self.scheme, self.path = url.split(":", 2)
-            self.path = self.path.split[2:] # get rid of initial "//" from path
+        if url.startswith("view-source:"):
+            self.metascheme = "view-source"
+            remaining_url = url[len("view-source:"):]
+
+            # split scheme
+            self.scheme, rest = remaining_url.split("://", 1)
+
+            # split host and path
+            if "/" in rest:
+                self.host, path = rest.split("/", 1)
+                self.path = "/" + path
+            else:
+                self.host = rest
+                self.path = "/"
+
+            self.port = 443 if self.scheme == "https" else 80
+            return
 
         self.scheme, url = url.split("://", 1)
-        # we only support http
         assert self.scheme in ["http", "https", "file", "data"], "Invalid url scheme provided"
 
         if self.scheme == "http":
@@ -47,6 +71,14 @@ class URL:
         self.path = "/" + url
 
     def request(self):
+        """
+        Handles the url's request depending on the scheme/metascheme.
+        For data, the content returned is text that follows "," in the url.
+        For file:///, file contents on the local machine are returned.
+        For view-source and all other schemes, a socket wrapped in ssl context is created to 
+            request data from the given URL.
+        """
+
         # no need to make a socket connection if opening a local file
         if self.scheme == "file":
             self.path = self.path.split("/", 1)[1] # remove the extra / from beginning of "file:///path_to_file" type urls
@@ -55,8 +87,12 @@ class URL:
 
         if self.scheme == "data":
             content_type, content = self.path.split(",", 1)
-            assert content_type == "text/html", "scheme is data but content_type is not text/html"
+            assert content_type == "text/html", "when scheme is 'data', content_type must be 'text/html'"
             return content
+        
+        # no need to split anything here
+        if getattr(self, "metascheme", None) == "view-source":
+            self.path = "/" + (self.path if self.path else "")
 
         s = socket.socket(
                 family=socket.AF_INET,
@@ -64,6 +100,7 @@ class URL:
                 proto=socket.IPPROTO_TCP,
                 )
         # tell the socket ot connect to host
+        print(f"connecting host {self.host} and port {self.port}")
         s.connect((self.host, self.port))
         if self.scheme == "https":
             ctx = ssl.create_default_context()
@@ -74,6 +111,8 @@ class URL:
         request += f"Connection: close\r\n"
         request += f"User-Agent: yug-patel-browser\r\n"
         request += "\r\n"
+
+        print(request)
         s.send(request.encode("utf8"))
 
         # makefile gives us a file like object which is decoded with utf8 back to a string
@@ -100,6 +139,11 @@ class URL:
         return content
 
 def show(body):
+    """
+    Read the html content obtained as a result of request method.
+    Checks for entity sequences for > and < too.
+    """
+
     in_tag = False
     i = 0
     while i < len(body):
@@ -125,21 +169,23 @@ def show(body):
             print(c, end="")
         i += 1
 
-# "a &lt; b"
-
-def show(body):
-    in_tag = False
+def show_source(body):
+    """
+    Print the source body as it is. Used for view-source metascheme.
+    """
     for c in body:
-        if c == "<":
-            in_tag = True
-        elif c == ">":
-            in_tag = False
-        elif not in_tag:
-            print(c, end="")
+        print(c, end="")
 
 def load(url):
+    """
+    Calls request() in the given url string and displays the body returned.
+    """
+
     body = url.request()
-    show(body)
+    if url.metascheme == "view-source":
+        show_source(body)
+    else:
+        show(body)
 
 if __name__ == "__main__":
     import sys
