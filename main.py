@@ -5,6 +5,10 @@
 import ssl
 import socket
 
+# stores (host, port) keys and previously used socket objects
+socket_cache = {}
+REDIRECT_LIMIT = 5
+
 class URL:
     def __init__(self, url):
         """
@@ -53,6 +57,7 @@ class URL:
             self.port = 443 if self.scheme == "https" else 80
             return
 
+        self.metascheme = None
         self.scheme, url = url.split("://", 1)
         assert self.scheme in ["http", "https", "file", "data"], "Invalid url scheme provided"
 
@@ -70,7 +75,7 @@ class URL:
 
         self.path = "/" + url
 
-    def request(self):
+    def request(self,redirects_remaining=REDIRECT_LIMIT):
         """
         Handles the url's request depending on the scheme/metascheme.
         For data, the content returned is text that follows "," in the url.
@@ -86,57 +91,109 @@ class URL:
             return f.read()
 
         if self.scheme == "data":
+            print(f"detected a data scheme")
+            print(f"self.path = {self.path}")
+            print(f"content = content")
+
             content_type, content = self.path.split(",", 1)
             assert content_type == "text/html", "when scheme is 'data', content_type must be 'text/html'"
+            print(f"cotent {content}")
             return content
         
         # no need to split anything here
         if getattr(self, "metascheme", None) == "view-source":
             self.path = "/" + (self.path if self.path else "")
 
-        s = socket.socket(
-                family=socket.AF_INET,
-                type=socket.SOCK_STREAM,
-                proto=socket.IPPROTO_TCP,
-                )
-        # tell the socket ot connect to host
-        print(f"connecting host {self.host} and port {self.port}")
-        s.connect((self.host, self.port))
-        if self.scheme == "https":
-            ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=self.host)
+        key = (self.host, self.port)
+
+        # try reusing existing socket
+        if key in socket_cache:
+            s = socket_cache[key]
+            try:
+                s.send(b"")
+            except OSError:
+                # closed by server, need to recreate
+                s = socket.socket(
+                        family=socket.AF_INET,
+                        type=socket.SOCK_STREAM,
+                        proto=socket.IPPROTO_TCP,
+                        )
+                s.connect(key)
+                if self.scheme == "https":
+                    ctx = ssl.create_default_context()
+                    s = ctx.wrap_socket(s, server_hostname=self.host)
+
+                socket_cache[key] = s
+        else:
+            # create new socket, connect, wrap
+            s = socket.socket(
+                    family=socket.AF_INET,
+                    type=socket.SOCK_STREAM,
+                    proto=socket.IPPROTO_TCP,
+                    )
+
+            s.connect(key)
+            if self.scheme == "https":
+                ctx = ssl.create_default_context()
+                s = ctx.wrap_socket(s, server_hostname=self.host)
+
+            socket_cache[key] = s
 
         request = f"GET {self.path} HTTP/1.0\r\n"
         request += f"Host: {self.host}\r\n"
-        request += f"Connection: close\r\n"
+        request += f"Connection: keep-alive\r\n"
         request += f"User-Agent: yug-patel-browser\r\n"
         request += "\r\n"
 
-        print(request)
         s.send(request.encode("utf8"))
 
         # makefile gives us a file like object which is decoded with utf8 back to a string
-        response = s.makefile("r", encoding="utf8", newline="\r\n")
+        response = s.makefile("rb")
 
-        statusline = response.readline()
+        statusline = response.readline().decode("ascii")
         version, status, explanation = statusline.split(" ", 2)
+        status = int(status)
         
-        # not asserting version is same as ours, because many misconfigured servers respond in 1.1 when we talk to them with 1.0
-
+        # read response headers
         response_headers = {}
         while True:
-            line = response.readline()
+            line = response.readline().decode("ascii")
             if line == "\r\n": break
             header, value = line.split(":", 1)
             response_headers[header.casefold()] = value.strip()
 
+        assert "content-length" in response_headers
         assert "transfer-encoding" not in response_headers
         assert "content-encoding" not in response_headers
 
-        content = response.read()
-        s.close()
+        # redirect handling
+        if 300 <= status <= 399:
+            if "location" not in response_headers:
+                raise Exception("Redirect with no location header.")
 
-        return content
+            new_url = response_headers["location"]
+
+            # if relative path, build full path
+            if new_url.startswith("/"):
+                new_url = f"{self.scheme}://{self.host}{new_url}"
+
+            # enforce redirect limit:
+            if redirects_remaining == 0:
+                raise Exception("Redirect limit of {REDIRECT_LIMIT} reached.")
+
+            # recursive call
+            redirected = URL(new_url)
+            return redirected.request(redirects_remaining - 1)
+        
+        # not asserting http version is same as ours, because many misconfigured servers respond in 1.1 when we talk to them with 1.0
+
+        
+        content_length = int(response_headers["content-length"])
+        content = response.read(content_length)
+
+        # not closing the socket but keeping it alive
+
+        return content.decode("utf8", errors="replace")
 
 def show(body):
     """
@@ -181,8 +238,8 @@ def load(url):
     Calls request() in the given url string and displays the body returned.
     """
 
-    body = url.request()
-    if url.metascheme == "view-source":
+    body = url.request(REDIRECT_LIMIT)
+    if url.metascheme and url.metascheme == "view-source":
         show_source(body)
     else:
         show(body)
