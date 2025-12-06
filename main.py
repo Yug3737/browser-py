@@ -139,7 +139,8 @@ class URL:
 
             socket_cache[key] = s
 
-        request = f"GET {self.path} HTTP/1.0\r\n"
+        method = "GET"
+        request = f"{method} {self.path} HTTP/1.0\r\n"
         request += f"Host: {self.host}\r\n"
         request += f"Connection: keep-alive\r\n"
         request += f"User-Agent: yug-patel-browser\r\n"
@@ -165,6 +166,16 @@ class URL:
         assert "content-length" in response_headers
         assert "transfer-encoding" not in response_headers
         assert "content-encoding" not in response_headers
+
+        # caching (no-store and max-age)
+        if (method == "GET" and
+            status in [200, 301, 404]):
+            directives_str = response_headers.get("cache-control", None)
+            print("directives ", directives_str)
+
+            if directives_str and "no-store" not in directives_str: # can cache response
+                print(f"Cache-control directives = {directives_str}")
+
 
         # redirect handling
         if 300 <= status <= 399:
