@@ -1,12 +1,17 @@
 # file: main.py
 # author: Yug Patel
-# last modified: 3 December 2025
+# last modified: 8 December 2025
 
 import ssl
 import socket
+from datetime import datetime, timedelta
 
 # stores (host, port) keys and previously used socket objects
 socket_cache = {}
+# stores urls as keys and values as dicts with these keys:
+# status_code, response_headers, body, timestamp, max_age
+# dict of dicts
+response_cache = {}
 REDIRECT_LIMIT = 5
 
 class URL:
@@ -21,6 +26,7 @@ class URL:
 
         Currently urls for data:text, file:/// do not allow a port in the url.
         """
+        self.url = url
 
         if url is None:
             self.metascheme = None
@@ -75,7 +81,7 @@ class URL:
 
         self.path = "/" + url
 
-    def request(self,redirects_remaining=REDIRECT_LIMIT):
+    def request(self, redirects_remaining=REDIRECT_LIMIT):
         """
         Handles the url's request depending on the scheme/metascheme.
         For data, the content returned is text that follows "," in the url.
@@ -91,15 +97,24 @@ class URL:
             return f.read()
 
         if self.scheme == "data":
-            print(f"detected a data scheme")
-            print(f"self.path = {self.path}")
-            print(f"content = content")
-
             content_type, content = self.path.split(",", 1)
             assert content_type == "text/html", "when scheme is 'data', content_type must be 'text/html'"
-            print(f"cotent {content}")
+            print(f"content {content}")
             return content
         
+        # check response_cache before making a socket request or checking for active sockets
+        if self.url in response_cache:
+            max_age = response_cache[self.url]["max_age"]
+            if not max_age:
+                raise Exception("max_age is stored in response cache for url: {url} but is None. URLs with no max_age should not be cached.")
+
+            max_age = timedelta(seconds=max_age)
+            
+            # is the cached response fresh enough?
+            if datetime.now() - response_cache[self.url]["timestamp"] <= max_age:
+                print("Returning cached response ------------------------")
+                return response_cache.get(self.url, None).get("content", None).decode("utf8", errors="replace")
+
         # no need to split anything here
         if getattr(self, "metascheme", None) == "view-source":
             self.path = "/" + (self.path if self.path else "")
@@ -167,15 +182,6 @@ class URL:
         assert "transfer-encoding" not in response_headers
         assert "content-encoding" not in response_headers
 
-        # caching (no-store and max-age)
-        if (method == "GET" and
-            status in [200, 301, 404]):
-            directives_str = response_headers.get("cache-control", None)
-            print("directives ", directives_str)
-
-            if directives_str and "no-store" not in directives_str: # can cache response
-                print(f"Cache-control directives = {directives_str}")
-
 
         # redirect handling
         if 300 <= status <= 399:
@@ -203,6 +209,51 @@ class URL:
         content = response.read(content_length)
 
         # not closing the socket but keeping it alive
+
+        # caching (no-store and max-age)
+        directives_str = response_headers.get("cache-control", None)
+        if not directives_str:
+            return content.decode("utf8", errors="replace")
+
+        print("caching directives ", directives_str)
+
+        if (method == "GET" and
+            status in [200, 301, 404]):
+
+            supported = ["max-age", "no-store"]
+            if directives_str:
+
+                directives = [dir.strip() for dir in directives_str.split(",")]
+                
+                # no caching if encounter an unsupported directive
+                directive_names = []
+                for dir in directives:
+                    name = dir.split("=")[0]
+                    directive_names.append(name)
+
+                for dir_name in directive_names:
+                    if dir_name not in supported:
+                        return content.decode("utf8", errors="replace")
+
+                # reject if no-store
+                if "no-store" in directives_str:
+                    return content.decode("utf8", errors="replace")
+
+                # extract max_age value
+                max_age = None
+                for dir in directives:
+                    if "max-age" == dir.split("=")[0]:
+                        max_age = int(dir.split("=")[1])
+                print(f"max_age obtained to be {max_age}")
+
+                if max_age is not None:
+                    response_cache[self.url] = {
+                            "status_code": status,
+                            "response_headers": response_headers,
+                            "content": content,
+                            "timestamp": datetime.now(),
+                            "max_age": max_age
+                    }
 
         return content.decode("utf8", errors="replace")
 
