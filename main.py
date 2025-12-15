@@ -1,9 +1,11 @@
 # file: main.py
 # author: Yug Patel
-# last modified: 8 December 2025
+# last modified: 9 December 2025
 
+import gzip
 import ssl
 import socket
+import tkinter
 from datetime import datetime, timedelta
 
 # stores (host, port) keys and previously used socket objects
@@ -81,6 +83,54 @@ class URL:
 
         self.path = "/" + url
 
+    def read_chunked(response):
+        """
+        Read a chunked-encoded HTTP body.
+        Returns raw bytes (exactly what was shared by the server)
+        """
+        chunks = []
+
+        while True:
+            size_line = response.readline().decode("ascii").strip()
+            chunk_size = int(size_line, 16)
+
+            if chunk_size == 0:
+                response.readline()
+                break
+
+            chunk = response.read(chunk_size)
+            chunks.append(chunk)
+
+            response.readline()
+
+        return b"".join(chunks)
+
+    def read_http_body(self, response, headers):
+        """
+        Returns raw bytes of the full HTTP body, handling content-length, chunked encoding and gzip.
+        Uses read_chunked method.
+        """
+
+        # step 1: read trasnport encoding (chunked or content-length)
+        if headers.get("transfer-encoding") == "chunked":
+            # server is sending chunks
+            raw = self.read_chunked(response)
+        elif "content-length" in headers:
+            # server tells us exactly how many bytes to read
+            length = int(headers["content-length"])
+            raw = response.read(length)
+
+        else:
+            # neither chunked nor content-length, read until connection closes
+            # allowed for HTTP 1.0
+            raw = response.read()
+        
+        # Step 2: handle content encodinng (gzip compression)
+        if headers.get("content-encoding") == "gzip":
+            # this means, raw contains compressed bytes which need to be decompressed
+            raw = gzip.decompress(raw)
+        return raw
+
     def request(self, redirects_remaining=REDIRECT_LIMIT):
         """
         Handles the url's request depending on the scheme/metascheme.
@@ -113,7 +163,7 @@ class URL:
             # is the cached response fresh enough?
             if datetime.now() - response_cache[self.url]["timestamp"] <= max_age:
                 print("Returning cached response ------------------------")
-                return response_cache.get(self.url, None).get("content", None).decode("utf8", errors="replace")
+                return response_cache[self.url]["content"].decode("utf8", errors="replace")
 
         # no need to split anything here
         if getattr(self, "metascheme", None) == "view-source":
@@ -159,6 +209,7 @@ class URL:
         request += f"Host: {self.host}\r\n"
         request += f"Connection: keep-alive\r\n"
         request += f"User-Agent: yug-patel-browser\r\n"
+        request += f"Accept-Encoding: gzip\r\n"
         request += "\r\n"
 
         s.send(request.encode("utf8"))
@@ -177,11 +228,6 @@ class URL:
             if line == "\r\n": break
             header, value = line.split(":", 1)
             response_headers[header.casefold()] = value.strip()
-
-        assert "content-length" in response_headers
-        assert "transfer-encoding" not in response_headers
-        assert "content-encoding" not in response_headers
-
 
         # redirect handling
         if 300 <= status <= 399:
@@ -205,24 +251,25 @@ class URL:
         # not asserting http version is same as ours, because many misconfigured servers respond in 1.1 when we talk to them with 1.0
 
         
-        content_length = int(response_headers["content-length"])
-        content = response.read(content_length)
+        # content_length = int(response_headers["content-length"])
+        # content = response.read(content_length)
+
+        raw_bytes = self.read_http_body(response, response_headers)
+        content = raw_bytes.decode("utf8", errors="replace")
 
         # not closing the socket but keeping it alive
 
         # caching (no-store and max-age)
         directives_str = response_headers.get("cache-control", None)
         if not directives_str:
-            return content.decode("utf8", errors="replace")
+            return content
 
-        print("caching directives ", directives_str)
+        # print("caching directives ", directives_str)
 
-        if (method == "GET" and
-            status in [200, 301, 404]):
-
+        if (method == "GET" and status in [200, 301, 404]):
             supported = ["max-age", "no-store"]
-            if directives_str:
 
+            if directives_str:
                 directives = [dir.strip() for dir in directives_str.split(",")]
                 
                 # no caching if encounter an unsupported directive
@@ -237,14 +284,14 @@ class URL:
 
                 # reject if no-store
                 if "no-store" in directives_str:
-                    return content.decode("utf8", errors="replace")
+                    return content
 
                 # extract max_age value
                 max_age = None
                 for dir in directives:
                     if "max-age" == dir.split("=")[0]:
                         max_age = int(dir.split("=")[1])
-                print(f"max_age obtained to be {max_age}")
+                # print(f"max_age obtained to be {max_age}")
 
                 if max_age is not None:
                     response_cache[self.url] = {
@@ -255,13 +302,10 @@ class URL:
                             "max_age": max_age
                     }
 
-        return content.decode("utf8", errors="replace")
+        return content # is already decoded
 
-def show(body):
-    """
-    Read the html content obtained as a result of request method.
-    Checks for entity sequences for > and < too.
-    """
+def lex(body):
+    text = ""
 
     in_tag = False
     i = 0
@@ -272,11 +316,13 @@ def show(body):
             # grab the next 3 chars too and check if we have a valid entity sequence
             prospective_entity = body[i:i+4]
             if prospective_entity == "&lt;":
-                print("<", end="")
+                text += "<"
+                # print("<", end="")
                 i += 4
                 continue
             elif prospective_entity == "&gt;":
-                print(">", end="")
+                text += ">"
+                # print(">", end="")
                 i += 4
                 continue
 
@@ -285,8 +331,37 @@ def show(body):
         elif c == ">":
             in_tag = False
         elif not in_tag:
-            print(c, end="")
+            text += c
+            # print(c, end="")
         i += 1
+    return text
+
+
+#     while i < len(body):
+#         c = body[i]
+#         if c == "&" and not in_tag:
+#             prospective_entity = c
+#             # grab the next 3 chars too and check if we have a valid entity sequence
+#             prospective_entity = body[i:i+4]
+#             if prospective_entity == "&lt;":
+#                 print("<", end="")
+#                 i += 4
+#                 continue
+#             elif prospective_entity == "&gt;":
+#                 print(">", end="")
+#                 i += 4
+#                 continue
+#
+#         if c == "<":
+#             in_tag = True
+#         elif c == ">":
+#             in_tag = False
+#         elif not in_tag:
+#             print(c, end="")
+#         i += 1
+
+def lex_source(body):
+    return body
 
 def show_source(body):
     """
@@ -295,17 +370,44 @@ def show_source(body):
     for c in body:
         print(c, end="")
 
-def load(url):
-    """
-    Calls request() in the given url string and displays the body returned.
-    """
 
-    body = url.request(REDIRECT_LIMIT)
-    if url.metascheme and url.metascheme == "view-source":
-        show_source(body)
-    else:
-        show(body)
+
+WIDTH, HEIGHT = 800, 600
+
+class Browser:
+    def __init__(self):
+        self.window = tkinter.Tk()
+        self.canvas = tkinter.Canvas(
+                self.window,
+                width=WIDTH,
+                height=HEIGHT
+                )
+        self.canvas.pack()
+
+    def load(self, url):
+        """
+        Calls request() in the given url string and displays the body returned.
+        """
+
+        body = url.request(REDIRECT_LIMIT)
+        text = ""
+        if url.metascheme and url.metascheme == "view-source":
+            text = lex_souce(body)
+        else:
+            text = lex(body)
+            
+
+        HSTEP, VSTEP = 13, 18
+        cursor_x, cursor_y = HSTEP, VSTEP
+        for c in text:
+            self.canvas.create_text(cursor_x, cursor_y, text=c)
+            cursor_x += HSTEP
+            if cursor_x + HSTEP >= WIDTH:
+                cursor_y += VSTEP
+                cursor_x = HSTEP
+
 
 if __name__ == "__main__":
     import sys
-    load(URL(sys.argv[1]))
+    Browser().load(URL(sys.argv[1]))
+    tkinter.mainloop()
