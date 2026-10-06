@@ -1,1 +1,1 @@
-"# Browser concepts implementation in python" 
+# Implementation of Browser concepts in Python
